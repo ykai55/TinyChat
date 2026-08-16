@@ -12,7 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -51,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.llmchat.data.ApiConfig
@@ -86,7 +87,7 @@ fun SettingsScreen(
 
   BackHandler(onBack = onBack)
   Scaffold(
-    contentWindowInsets = WindowInsets.safeDrawing,
+    contentWindowInsets = WindowInsets.systemBars,
     topBar = {
       CenterAlignedTopAppBar(
         title = { Text("模型设置") },
@@ -133,7 +134,11 @@ fun SettingsScreen(
             supportingText = { Text("应用会自动追加 /chat/completions") },
             isError = baseUrl.isNotBlank() && !validUrl,
             singleLine = true,
-            keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
+            keyboardOptions =
+              KeyboardOptions(
+                autoCorrectEnabled = false,
+                keyboardType = KeyboardType.Uri,
+              ),
           )
           OutlinedTextField(
             value = apiKey,
@@ -152,7 +157,11 @@ fun SettingsScreen(
             visualTransformation =
               if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
             singleLine = true,
-            keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
+            keyboardOptions =
+              KeyboardOptions(
+                autoCorrectEnabled = false,
+                keyboardType = KeyboardType.Password,
+              ),
           )
           Row(
             modifier = Modifier.fillMaxWidth(),
@@ -214,7 +223,11 @@ fun SettingsScreen(
               },
               supportingText = { Text("支持直接输入未出现在列表中的模型 ID") },
               singleLine = true,
-              keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
+              keyboardOptions =
+                KeyboardOptions(
+                  autoCorrectEnabled = false,
+                  keyboardType = KeyboardType.Ascii,
+                ),
             )
             DropdownMenu(
               expanded = modelsExpanded && chatModels.isNotEmpty(),
@@ -249,7 +262,11 @@ fun SettingsScreen(
               },
               supportingText = { Text("用于对话模型调用生图工具；留空则关闭自动生图") },
               singleLine = true,
-              keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
+              keyboardOptions =
+                KeyboardOptions(
+                  autoCorrectEnabled = false,
+                  keyboardType = KeyboardType.Ascii,
+                ),
             )
             DropdownMenu(
               expanded = imageModelsExpanded && imageModels.isNotEmpty(),

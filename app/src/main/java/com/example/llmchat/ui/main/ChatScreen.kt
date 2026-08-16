@@ -15,7 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.clickable
@@ -76,6 +76,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -142,7 +144,7 @@ fun ChatScreen(
     },
   ) {
     Scaffold(
-      contentWindowInsets = WindowInsets.safeDrawing,
+      contentWindowInsets = WindowInsets.systemBars,
       snackbarHost = { SnackbarHost(snackbarHostState) },
       topBar = {
         CenterAlignedTopAppBar(
@@ -582,7 +584,12 @@ private fun MessageComposer(
           minLines = 1,
           maxLines = 6,
           shape = MaterialTheme.shapes.extraLarge,
-          keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+          keyboardOptions =
+            KeyboardOptions(
+              capitalization = KeyboardCapitalization.Sentences,
+              keyboardType = KeyboardType.Text,
+              imeAction = ImeAction.Send,
+            ),
           keyboardActions = KeyboardActions(onSend = { submit() }),
           colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent),
         )
