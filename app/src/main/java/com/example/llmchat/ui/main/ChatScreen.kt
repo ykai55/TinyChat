@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -69,6 +70,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -329,9 +331,71 @@ private fun MessageList(
   }
 
   val listState = rememberLazyListState()
+  var followsLatest by remember(conversationId) { mutableStateOf(true) }
+  var automaticScrollInProgress by remember(conversationId) { mutableStateOf(false) }
+  var canResumeFromCurrentScroll by remember(conversationId) { mutableStateOf(false) }
   val itemCount = messages.size + if (isGenerating) 1 else 0
-  LaunchedEffect(conversationId, messages.lastOrNull()?.id, itemCount, streamingText.length) {
-    if (itemCount > 0) listState.scrollToItem(itemCount - 1)
+  // The first drag pauses following; only a later drag can resume it at the bottom.
+  LaunchedEffect(listState, conversationId) {
+    listState.interactionSource.interactions.collect { interaction ->
+      if (interaction is DragInteraction.Start) {
+        canResumeFromCurrentScroll = !followsLatest
+        followsLatest = false
+      }
+    }
+  }
+  LaunchedEffect(listState, conversationId) {
+    snapshotFlow {
+        Triple(
+          listState.isScrollInProgress,
+          listState.lastScrolledBackward,
+          listState.canScrollForward,
+        )
+      }
+      .collect { (isScrolling, scrolledBackward, canScrollForward) ->
+        if (!automaticScrollInProgress && isScrolling && scrolledBackward) {
+          followsLatest = false
+          canResumeFromCurrentScroll = false
+        } else if (canResumeFromCurrentScroll && !scrolledBackward && !canScrollForward) {
+          followsLatest = true
+          canResumeFromCurrentScroll = false
+        } else if (canResumeFromCurrentScroll && !isScrolling) {
+          canResumeFromCurrentScroll = false
+        }
+      }
+  }
+  // Track the last item's height so a growing streaming message stays aligned to its tail.
+  LaunchedEffect(
+    conversationId,
+    messages.lastOrNull()?.id,
+    isGenerating,
+    followsLatest,
+  ) {
+    if (followsLatest && itemCount > 0) {
+      val targetIndex = itemCount - 1
+      automaticScrollInProgress = true
+      try {
+        if (listState.layoutInfo.visibleItemsInfo.none { it.index == targetIndex }) {
+          listState.scrollToItem(targetIndex)
+        }
+      } finally {
+        automaticScrollInProgress = false
+      }
+      snapshotFlow {
+          val layoutInfo = listState.layoutInfo
+          val itemSize = layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }?.size
+          itemSize?.let { it to layoutInfo.viewportSize.height }
+        }
+        .collect { metrics ->
+          val (itemSize, viewportHeight) = metrics ?: return@collect
+          automaticScrollInProgress = true
+          try {
+            listState.scrollToItem(targetIndex, (itemSize - viewportHeight).coerceAtLeast(0))
+          } finally {
+            automaticScrollInProgress = false
+          }
+        }
+    }
   }
   LazyColumn(
     state = listState,
