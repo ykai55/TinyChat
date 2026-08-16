@@ -212,6 +212,7 @@ fun ChatScreen(
           conversationId = state.selectedConversationId,
           messages = state.messages,
           streamingText = if (state.isGeneratingCurrentConversation) state.streamingText else "",
+          streamingUserMessageId = state.streamingUserMessageId,
           isGenerating = state.isGeneratingCurrentConversation,
           onSuggestion = onSend,
           modifier = Modifier.weight(1f),
@@ -325,6 +326,7 @@ private fun MessageList(
   conversationId: Long?,
   messages: List<ChatMessage>,
   streamingText: String,
+  streamingUserMessageId: Long?,
   isGenerating: Boolean,
   onSuggestion: (String) -> Unit,
   modifier: Modifier = Modifier,
@@ -334,6 +336,41 @@ private fun MessageList(
     return
   }
 
+  val persistedStreamingMessageId =
+    if (isGenerating && streamingUserMessageId != null) {
+      messages.indices.lastOrNull { index ->
+        messages[index].role == MessageRole.Assistant &&
+          messages.getOrNull(index - 1)?.id == streamingUserMessageId
+      }?.let { messages[it].id }
+    } else {
+      null
+    }
+  val displayMessages =
+    buildList {
+      messages.forEachIndexed { index, message ->
+        if (message.id == persistedStreamingMessageId) return@forEachIndexed
+        val previousMessage = messages.getOrNull(index - 1)
+        val key =
+          if (message.role == MessageRole.Assistant && previousMessage?.role == MessageRole.User) {
+            "assistant-for-${previousMessage.id}"
+          } else {
+            "message-${message.id}"
+          }
+        add(DisplayMessage(key, message.role, message.content, message.images))
+      }
+      if (isGenerating) {
+        add(
+          DisplayMessage(
+            key = streamingUserMessageId?.let { "assistant-for-$it" } ?: "streaming",
+            role = MessageRole.Assistant,
+            content = streamingText,
+            images = emptyList(),
+            showCursor = true,
+          )
+        )
+      }
+    }
+
   val listState =
     rememberLazyListState(
       cacheWindow = LazyLayoutCacheWindow(aheadFraction = 2f, behindFraction = 2f),
@@ -341,7 +378,7 @@ private fun MessageList(
   var followsLatest by remember(conversationId) { mutableStateOf(true) }
   var automaticScrollInProgress by remember(conversationId) { mutableStateOf(false) }
   var canResumeFromCurrentScroll by remember(conversationId) { mutableStateOf(false) }
-  val bottomAnchorIndex = messages.size + if (isGenerating) 1 else 0
+  val bottomAnchorIndex = displayMessages.size
   // The first drag pauses following; only a later drag can resume it at the bottom.
   LaunchedEffect(listState, conversationId) {
     listState.interactionSource.interactions.collect { interaction ->
@@ -394,22 +431,20 @@ private fun MessageList(
     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 18.dp),
     verticalArrangement = Arrangement.spacedBy(16.dp),
   ) {
-    items(messages, key = { it.id }, contentType = { it.role }) {
-      MessageBubble(it.role, it.content, it.images)
-    }
-    if (isGenerating) {
-      item(key = "streaming", contentType = MessageRole.Assistant) {
-        MessageBubble(
-          role = MessageRole.Assistant,
-          content = streamingText,
-          images = emptyList(),
-          showCursor = true,
-        )
-      }
+    items(displayMessages, key = { it.key }, contentType = { it.role }) {
+      MessageBubble(it.role, it.content, it.images, it.showCursor)
     }
     item(key = "bottom-anchor") { Spacer(Modifier.height(1.dp)) }
   }
 }
+
+private data class DisplayMessage(
+  val key: String,
+  val role: MessageRole,
+  val content: String,
+  val images: List<MessageImage>,
+  val showCursor: Boolean = false,
+)
 
 @Composable
 private fun WelcomePanel(onSuggestion: (String) -> Unit, modifier: Modifier = Modifier) {

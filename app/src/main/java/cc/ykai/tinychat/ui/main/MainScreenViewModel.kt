@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
@@ -73,6 +74,7 @@ class ChatViewModel(
           selectedConversationId = selectedId,
           messages = messageList,
           generatingConversationId = activeGeneration.conversationId,
+          streamingUserMessageId = activeGeneration.userMessageId,
           streamingText = activeGeneration.text,
           errorMessage = error,
           config = config.value,
@@ -151,24 +153,27 @@ class ChatViewModel(
             }
           conversationId = activeConversationId
 
-          repository.addMessage(
+          val userMessageId = repository.addMessage(
             activeConversationId,
             MessageRole.User,
             prompt,
             attachedImages,
           )
           pendingImages.value = emptyList()
-          generation.value = Generation(activeConversationId)
+          generation.value =
+            Generation(
+              conversationId = activeConversationId,
+              userMessageId = userMessageId,
+            )
 
           val explicitImagePrompt = explicitImagePrompt(prompt)
           if (explicitImagePrompt != null) {
-            generation.value = Generation(activeConversationId, "正在生成图片…")
+            generation.value = generation.value.copy(text = "正在生成图片…")
             val generated = apiClient.generateImage(currentConfig, explicitImagePrompt)
             val savedImages = generated.map { imageStore.saveGeneratedImage(it.source) }
             if (savedImages.isEmpty()) throw LlmApiException("图片模型没有返回图片")
-            repository.addMessage(
+            persistAssistantMessage(
               activeConversationId,
-              MessageRole.Assistant,
               "已生成图片",
               savedImages,
             )
@@ -181,7 +186,7 @@ class ChatViewModel(
               when (event) {
                 is ChatStreamEvent.Text -> {
                   generatedText += event.value
-                  generation.value = Generation(activeConversationId, generatedText)
+                  generation.value = generation.value.copy(text = generatedText)
                 }
                 is ChatStreamEvent.ToolCallDelta -> {
                   if (event.name != null) toolName = event.name
@@ -192,14 +197,13 @@ class ChatViewModel(
             }
 
             if (toolName == "generate_image") {
-              generation.value = Generation(activeConversationId, "正在生成图片…")
+              generation.value = generation.value.copy(text = "正在生成图片…")
               val imagePrompt = parseImageToolPrompt(toolArguments.toString())
               val generated = apiClient.generateImage(currentConfig, imagePrompt)
               val savedImages = generated.map { imageStore.saveGeneratedImage(it.source) }
               if (savedImages.isEmpty()) throw LlmApiException("图片模型没有返回图片")
-              repository.addMessage(
+              persistAssistantMessage(
                 activeConversationId,
-                MessageRole.Assistant,
                 generatedText.ifBlank { "已生成图片" },
                 savedImages,
               )
@@ -208,9 +212,8 @@ class ChatViewModel(
               if (generatedText.isBlank() && savedImages.isEmpty()) {
                 throw LlmApiException("模型没有返回文本或图片内容")
               }
-              repository.addMessage(
+              persistAssistantMessage(
                 activeConversationId,
-                MessageRole.Assistant,
                 generatedText,
                 savedImages,
               )
@@ -218,20 +221,31 @@ class ChatViewModel(
           }
         } catch (cancelled: CancellationException) {
           if (generatedText.isNotBlank() && conversationId != null) {
-            withContext(NonCancellable) {
-              repository.addMessage(conversationId, MessageRole.Assistant, generatedText)
-            }
+            persistAssistantMessage(conversationId, generatedText)
           }
           throw cancelled
         } catch (error: Exception) {
           if (generatedText.isNotBlank() && conversationId != null) {
-            repository.addMessage(conversationId, MessageRole.Assistant, generatedText)
+            persistAssistantMessage(conversationId, generatedText)
           }
           errorMessage.value = "生成失败：${error.message ?: "未知错误"}"
         } finally {
           if (generation.value.conversationId == conversationId) generation.value = Generation()
         }
       }
+  }
+
+  private suspend fun persistAssistantMessage(
+    conversationId: Long,
+    content: String,
+    images: List<MessageImage> = emptyList(),
+  ) = withContext(NonCancellable) {
+    val messageId = repository.addMessage(conversationId, MessageRole.Assistant, content, images)
+    if (generation.value.conversationId != conversationId) return@withContext
+    combine(messages, selectedConversationId) { messageList, selectedId ->
+        selectedId != conversationId || messageList.any { it.id == messageId }
+      }
+      .first { it }
   }
 
   fun stopGeneration() {
@@ -314,6 +328,7 @@ data class ChatUiState(
   val selectedConversationId: Long? = null,
   val messages: List<ChatMessage> = emptyList(),
   val generatingConversationId: Long? = null,
+  val streamingUserMessageId: Long? = null,
   val streamingText: String = "",
   val errorMessage: String? = null,
   val config: ApiConfig = ApiConfig(),
@@ -333,7 +348,11 @@ data class ChatUiState(
     get() = conversations.firstOrNull { it.id == selectedConversationId }
 }
 
-private data class Generation(val conversationId: Long? = null, val text: String = "")
+private data class Generation(
+  val conversationId: Long? = null,
+  val userMessageId: Long? = null,
+  val text: String = "",
+)
 
 private data class ModelCatalog(
   val models: List<String> = emptyList(),
