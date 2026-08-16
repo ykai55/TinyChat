@@ -204,6 +204,7 @@ fun ChatScreen(
             .padding(padding),
       ) {
         MessageList(
+          conversationId = state.selectedConversationId,
           messages = state.messages,
           streamingText = if (state.isGeneratingCurrentConversation) state.streamingText else "",
           isGenerating = state.isGeneratingCurrentConversation,
@@ -315,6 +316,7 @@ private fun ConversationDrawer(
 
 @Composable
 private fun MessageList(
+  conversationId: Long?,
   messages: List<ChatMessage>,
   streamingText: String,
   isGenerating: Boolean,
@@ -328,7 +330,7 @@ private fun MessageList(
 
   val listState = rememberLazyListState()
   val itemCount = messages.size + if (isGenerating) 1 else 0
-  LaunchedEffect(itemCount, streamingText.length) {
+  LaunchedEffect(conversationId, messages.lastOrNull()?.id, itemCount, streamingText.length) {
     if (itemCount > 0) listState.scrollToItem(itemCount - 1)
   }
   LazyColumn(
