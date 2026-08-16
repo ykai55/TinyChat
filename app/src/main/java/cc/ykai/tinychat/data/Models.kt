@@ -14,6 +14,9 @@ data class ChatMessage(
   val content: String,
   val createdAt: Long,
   val images: List<MessageImage> = emptyList(),
+  val parentId: Long? = null,
+  val branchIndex: Int = 0,
+  val branchCount: Int = 1,
 )
 
 data class MessageImage(val source: String, val mimeType: String)

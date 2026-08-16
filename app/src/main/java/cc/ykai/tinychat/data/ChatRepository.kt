@@ -24,6 +24,9 @@ class ChatRepository(context: Context) {
   suspend fun messages(conversationId: Long): List<ChatMessage> =
     withContext(Dispatchers.IO) { database.messages(conversationId) }
 
+  suspend fun message(id: Long): ChatMessage? =
+    withContext(Dispatchers.IO) { database.message(id) }
+
   suspend fun createConversation(title: String = "新对话"): Long =
     withContext(Dispatchers.IO) {
       val id = database.createConversation(title, System.currentTimeMillis())
@@ -43,6 +46,7 @@ class ChatRepository(context: Context) {
     role: MessageRole,
     content: String,
     images: List<MessageImage> = emptyList(),
+    parentMessageId: Long? = null,
   ): Long =
     withContext(Dispatchers.IO) {
       val id =
@@ -51,11 +55,18 @@ class ChatRepository(context: Context) {
           role,
           content,
           images,
+          parentMessageId,
           System.currentTimeMillis(),
         )
       notifyChanged()
       id
     }
+
+  suspend fun selectSibling(messageId: Long, offset: Int) {
+    withContext(Dispatchers.IO) {
+      if (database.selectSibling(messageId, offset)) notifyChanged()
+    }
+  }
 
   suspend fun deleteConversation(id: Long) {
     withContext(Dispatchers.IO) {

@@ -11,6 +11,7 @@ android {
         applicationId = "cc.ykai.tinychat"
         minSdk = 26
         targetSdk = 36
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 1
         versionName = "1.0"
     }

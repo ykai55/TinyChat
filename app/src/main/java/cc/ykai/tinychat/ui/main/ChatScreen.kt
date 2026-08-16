@@ -32,16 +32,21 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Menu
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.StopCircle
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -61,6 +66,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.DrawerValue
@@ -108,8 +114,11 @@ fun ChatScreen(
   onNewConversation: () -> Unit,
   onSelectConversation: (Long) -> Unit,
   onDeleteConversation: (Long) -> Unit,
-  onSend: (String) -> Unit,
+  onSend: (String) -> Boolean,
   onStop: () -> Unit,
+  onEditUserMessage: (Long, String) -> Unit,
+  onRetryMessage: (Long) -> Unit,
+  onSelectMessageBranch: (Long, Int) -> Unit,
   onAddImages: (List<android.net.Uri>) -> Unit,
   onRemovePendingImage: (MessageImage) -> Unit,
   onOpenSettings: () -> Unit,
@@ -119,6 +128,8 @@ fun ChatScreen(
   val drawerState = rememberDrawerState(DrawerValue.Closed)
   val scope = rememberCoroutineScope()
   val snackbarHostState = remember { SnackbarHostState() }
+  var editingMessage by
+    remember(state.selectedConversationId) { mutableStateOf<ChatMessage?>(null) }
   val imagePicker =
     rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(4)) { uris ->
       onAddImages(uris)
@@ -129,6 +140,10 @@ fun ChatScreen(
     snackbarHostState.showSnackbar(error)
     onErrorShown()
   }
+  LaunchedEffect(state.messages, editingMessage?.id) {
+    val editingMessageId = editingMessage?.id ?: return@LaunchedEffect
+    if (state.messages.none { it.id == editingMessageId }) editingMessage = null
+  }
 
   ModalNavigationDrawer(
     drawerState = drawerState,
@@ -136,6 +151,7 @@ fun ChatScreen(
       ConversationDrawer(
         conversations = state.conversations,
         selectedId = state.selectedConversationId,
+        deleteEnabled = !state.isPreparingGeneration && !state.isChangingBranch,
         onNewConversation = {
           onNewConversation()
           scope.launch { drawerState.close() }
@@ -214,12 +230,17 @@ fun ChatScreen(
           streamingText = if (state.isGeneratingCurrentConversation) state.streamingText else "",
           streamingUserMessageId = state.streamingUserMessageId,
           isGenerating = state.isGeneratingCurrentConversation,
-          onSuggestion = onSend,
+          actionsEnabled = !state.isGenerating && !state.isChangingBranch && !state.isImportingImages,
+          onSuggestion = { onSend(it) },
+          onEditMessage = { editingMessage = it },
+          onRetryMessage = onRetryMessage,
+          onSelectBranch = onSelectMessageBranch,
           modifier = Modifier.weight(1f),
         )
         MessageComposer(
           conversationId = state.selectedConversationId,
-          isGenerating = state.isGenerating,
+          isGenerating = state.isGenerating || state.isChangingBranch,
+          isPreparingGeneration = state.isPreparingGeneration || state.isChangingBranch,
           configReady = state.config.isReady,
           pendingImages = state.pendingImages,
           isImportingImages = state.isImportingImages,
@@ -233,12 +254,24 @@ fun ChatScreen(
       }
     }
   }
+  editingMessage?.let { message ->
+    EditMessageDialog(
+      message = message,
+      enabled = !state.isGenerating && !state.isChangingBranch && !state.isImportingImages,
+      onDismiss = { editingMessage = null },
+      onConfirm = { content ->
+        editingMessage = null
+        onEditUserMessage(message.id, content)
+      },
+    )
+  }
 }
 
 @Composable
 private fun ConversationDrawer(
   conversations: List<Conversation>,
   selectedId: Long?,
+  deleteEnabled: Boolean,
   onNewConversation: () -> Unit,
   onSelectConversation: (Long) -> Unit,
   onDeleteConversation: (Long) -> Unit,
@@ -305,7 +338,10 @@ private fun ConversationDrawer(
             selected = conversation.id == selectedId,
             onClick = { onSelectConversation(conversation.id) },
             badge = {
-              IconButton(onClick = { onDeleteConversation(conversation.id) }) {
+              IconButton(
+                onClick = { onDeleteConversation(conversation.id) },
+                enabled = deleteEnabled,
+              ) {
                 Icon(
                   Icons.Outlined.DeleteOutline,
                   contentDescription = "删除 ${conversation.title}",
@@ -328,7 +364,11 @@ private fun MessageList(
   streamingText: String,
   streamingUserMessageId: Long?,
   isGenerating: Boolean,
+  actionsEnabled: Boolean,
   onSuggestion: (String) -> Unit,
+  onEditMessage: (ChatMessage) -> Unit,
+  onRetryMessage: (Long) -> Unit,
+  onSelectBranch: (Long, Int) -> Unit,
   modifier: Modifier = Modifier,
 ) {
   if (messages.isEmpty() && !isGenerating) {
@@ -336,32 +376,37 @@ private fun MessageList(
     return
   }
 
-  val persistedStreamingMessageId =
+  val visibleMessages =
     if (isGenerating && streamingUserMessageId != null) {
-      messages.indices.lastOrNull { index ->
-        messages[index].role == MessageRole.Assistant &&
-          messages.getOrNull(index - 1)?.id == streamingUserMessageId
-      }?.let { messages[it].id }
+      val userMessageIndex = messages.indexOfFirst { it.id == streamingUserMessageId }
+      if (userMessageIndex == -1) messages else messages.take(userMessageIndex + 1)
     } else {
-      null
+      messages
     }
   val displayMessages =
     buildList {
-      messages.forEachIndexed { index, message ->
-        if (message.id == persistedStreamingMessageId) return@forEachIndexed
-        val previousMessage = messages.getOrNull(index - 1)
+      visibleMessages.forEach { message ->
         val key =
-          if (message.role == MessageRole.Assistant && previousMessage?.role == MessageRole.User) {
-            "assistant-for-${previousMessage.id}"
+          if (message.role == MessageRole.Assistant && message.parentId != null) {
+            "assistant-for-${message.parentId}"
           } else {
             "message-${message.id}"
           }
-        add(DisplayMessage(key, message.role, message.content, message.images))
+        add(
+          DisplayMessage(
+            key = key,
+            message = message,
+            role = message.role,
+            content = message.content,
+            images = message.images,
+          )
+        )
       }
       if (isGenerating) {
         add(
           DisplayMessage(
             key = streamingUserMessageId?.let { "assistant-for-$it" } ?: "streaming",
+            message = null,
             role = MessageRole.Assistant,
             content = streamingText,
             images = emptyList(),
@@ -431,8 +476,20 @@ private fun MessageList(
     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 18.dp),
     verticalArrangement = Arrangement.spacedBy(16.dp),
   ) {
-    items(displayMessages, key = { it.key }, contentType = { it.role }) {
-      MessageBubble(it.role, it.content, it.images, it.showCursor)
+    items(displayMessages, key = { it.key }, contentType = { it.role }) { displayMessage ->
+      MessageBubble(
+        role = displayMessage.role,
+        content = displayMessage.content,
+        images = displayMessage.images,
+        message = displayMessage.message,
+        showCursor = displayMessage.showCursor,
+        actionsEnabled = actionsEnabled,
+        onEdit = { displayMessage.message?.let(onEditMessage) },
+        onRetry = { displayMessage.message?.id?.let(onRetryMessage) },
+        onSelectBranch = { offset ->
+          displayMessage.message?.id?.let { onSelectBranch(it, offset) }
+        },
+      )
     }
     item(key = "bottom-anchor") { Spacer(Modifier.height(1.dp)) }
   }
@@ -440,6 +497,7 @@ private fun MessageList(
 
 private data class DisplayMessage(
   val key: String,
+  val message: ChatMessage?,
   val role: MessageRole,
   val content: String,
   val images: List<MessageImage>,
@@ -495,7 +553,12 @@ private fun MessageBubble(
   role: MessageRole,
   content: String,
   images: List<MessageImage>,
+  message: ChatMessage?,
   showCursor: Boolean = false,
+  actionsEnabled: Boolean,
+  onEdit: () -> Unit,
+  onRetry: () -> Unit,
+  onSelectBranch: (Int) -> Unit,
 ) {
   val isUser = role == MessageRole.User
   Row(
@@ -543,25 +606,151 @@ private fun MessageBubble(
               if (content.isEmpty() && showCursor) "正在思考…"
               else content + if (showCursor) " ▍" else ""
             val markdownState = rememberMarkdownState(markdown, retainState = true)
-            Markdown(
-              markdownState = markdownState,
-              modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-              imageTransformer = Coil3ImageTransformerImpl,
-              typography =
-                markdownTypography(
-                  h1 = MaterialTheme.typography.headlineMedium,
-                  h2 = MaterialTheme.typography.headlineSmall,
-                  h3 = MaterialTheme.typography.titleLarge,
-                  h4 = MaterialTheme.typography.titleMedium,
-                  h5 = MaterialTheme.typography.titleSmall,
-                  h6 = MaterialTheme.typography.labelLarge,
-                ),
-            )
+            SelectionContainer {
+              Markdown(
+                markdownState = markdownState,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                imageTransformer = Coil3ImageTransformerImpl,
+                typography =
+                  markdownTypography(
+                    h1 = MaterialTheme.typography.headlineMedium,
+                    h2 = MaterialTheme.typography.headlineSmall,
+                    h3 = MaterialTheme.typography.titleLarge,
+                    h4 = MaterialTheme.typography.titleMedium,
+                    h5 = MaterialTheme.typography.titleSmall,
+                    h6 = MaterialTheme.typography.labelLarge,
+                  ),
+              )
+            }
           }
+        }
+        if (message != null && !showCursor) {
+          MessageActions(
+            message = message,
+            enabled = actionsEnabled,
+            onEdit = onEdit,
+            onRetry = onRetry,
+            onSelectBranch = onSelectBranch,
+          )
         }
       }
     }
   }
+}
+
+@Composable
+private fun MessageActions(
+  message: ChatMessage,
+  enabled: Boolean,
+  onEdit: () -> Unit,
+  onRetry: () -> Unit,
+  onSelectBranch: (Int) -> Unit,
+) {
+  Row(
+    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+    verticalAlignment = Alignment.CenterVertically,
+  ) {
+    if (message.role == MessageRole.User) {
+      MessageActionButton(
+        label = "编辑",
+        icon = { Icon(Icons.Outlined.Edit, contentDescription = null, modifier = Modifier.size(16.dp)) },
+        enabled = enabled,
+        onClick = onEdit,
+      )
+    }
+    MessageActionButton(
+      label = "重试",
+      icon = { Icon(Icons.Outlined.Refresh, contentDescription = null, modifier = Modifier.size(16.dp)) },
+      enabled = enabled,
+      onClick = onRetry,
+    )
+    Spacer(Modifier.weight(1f))
+    if (message.branchCount > 1) {
+      IconButton(
+        onClick = { onSelectBranch(-1) },
+        enabled = enabled && message.branchIndex > 0,
+        modifier = Modifier.size(36.dp),
+      ) {
+        Icon(Icons.AutoMirrored.Outlined.KeyboardArrowLeft, contentDescription = "上一个分支")
+      }
+      Text(
+        "${message.branchIndex + 1}/${message.branchCount}",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+      IconButton(
+        onClick = { onSelectBranch(1) },
+        enabled = enabled && message.branchIndex < message.branchCount - 1,
+        modifier = Modifier.size(36.dp),
+      ) {
+        Icon(Icons.AutoMirrored.Outlined.KeyboardArrowRight, contentDescription = "下一个分支")
+      }
+    }
+  }
+}
+
+@Composable
+private fun MessageActionButton(
+  label: String,
+  icon: @Composable () -> Unit,
+  enabled: Boolean,
+  onClick: () -> Unit,
+) {
+  TextButton(
+    onClick = onClick,
+    enabled = enabled,
+    contentPadding = PaddingValues(horizontal = 8.dp),
+  ) {
+    icon()
+    Spacer(Modifier.width(4.dp))
+    Text(label)
+  }
+}
+
+@Composable
+private fun EditMessageDialog(
+  message: ChatMessage,
+  enabled: Boolean,
+  onDismiss: () -> Unit,
+  onConfirm: (String) -> Unit,
+) {
+  var draft by rememberSaveable(message.id) { mutableStateOf(message.content) }
+  val normalizedDraft = draft.trim()
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text("编辑消息") },
+    text = {
+      Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+          value = draft,
+          onValueChange = { draft = it },
+          modifier = Modifier.fillMaxWidth(),
+          minLines = 3,
+          maxLines = 8,
+          label = { Text("消息内容") },
+        )
+        if (message.images.isNotEmpty()) {
+          Text(
+            "原消息中的图片会保留在新分支中。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+        }
+      }
+    },
+    confirmButton = {
+      TextButton(
+        onClick = { onConfirm(normalizedDraft) },
+        enabled =
+          enabled &&
+            (normalizedDraft.isNotEmpty() || message.images.isNotEmpty()) &&
+            normalizedDraft != message.content,
+      ) {
+        Text("保存并重试")
+      }
+    },
+    dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+  )
 }
 
 @Composable
@@ -618,20 +807,20 @@ private fun MessageImages(images: List<MessageImage>, modifier: Modifier = Modif
 private fun MessageComposer(
   conversationId: Long?,
   isGenerating: Boolean,
+  isPreparingGeneration: Boolean,
   configReady: Boolean,
   pendingImages: List<MessageImage>,
   isImportingImages: Boolean,
   onPickImages: () -> Unit,
   onRemovePendingImage: (MessageImage) -> Unit,
-  onSend: (String) -> Unit,
+  onSend: (String) -> Boolean,
   onStop: () -> Unit,
 ) {
   var draft by rememberSaveable(conversationId) { mutableStateOf("") }
 
   fun submit() {
     if ((draft.isBlank() && pendingImages.isEmpty()) || isGenerating || isImportingImages) return
-    onSend(draft)
-    if (configReady) draft = ""
+    if (onSend(draft)) draft = ""
   }
 
   Surface(tonalElevation = 3.dp, color = MaterialTheme.colorScheme.surface) {
@@ -655,6 +844,7 @@ private fun MessageComposer(
               )
               FilledIconButton(
                 onClick = { onRemovePendingImage(image) },
+                enabled = !isGenerating,
                 modifier = Modifier.align(Alignment.TopEnd).size(24.dp),
               ) {
                 Icon(Icons.Outlined.Close, contentDescription = "移除图片", modifier = Modifier.size(14.dp))
@@ -690,15 +880,20 @@ private fun MessageComposer(
           colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent),
         )
         FilledIconButton(
-          onClick = if (isGenerating) onStop else ::submit,
+          onClick = if (isGenerating && !isPreparingGeneration) onStop else ::submit,
           enabled =
-            isGenerating || (!isImportingImages && (draft.isNotBlank() || pendingImages.isNotEmpty())),
+            (isGenerating && !isPreparingGeneration) ||
+              (!isGenerating && !isImportingImages && (draft.isNotBlank() || pendingImages.isNotEmpty())),
           modifier = Modifier.size(50.dp),
         ) {
-          Icon(
-            imageVector = if (isGenerating) Icons.Outlined.StopCircle else Icons.AutoMirrored.Outlined.Send,
-            contentDescription = if (isGenerating) "停止生成" else "发送",
-          )
+          if (isPreparingGeneration) {
+            CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+          } else {
+            Icon(
+              imageVector = if (isGenerating) Icons.Outlined.StopCircle else Icons.AutoMirrored.Outlined.Send,
+              contentDescription = if (isGenerating) "停止生成" else "发送",
+            )
+          }
         }
       }
     }

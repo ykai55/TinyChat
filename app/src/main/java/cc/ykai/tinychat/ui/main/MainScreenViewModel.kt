@@ -20,6 +20,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -30,6 +31,8 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -41,6 +44,8 @@ class ChatViewModel(
 ) : ViewModel() {
   private val selectedConversationId = MutableStateFlow<Long?>(null)
   private val generation = MutableStateFlow(Generation())
+  private val generationStarting = MutableStateFlow(false)
+  private val isChangingBranch = MutableStateFlow(false)
   private val errorMessage = MutableStateFlow<String?>(null)
   private val config = MutableStateFlow(configStore.load())
   private val modelCatalog = MutableStateFlow(ModelCatalog())
@@ -48,6 +53,7 @@ class ChatViewModel(
   private val isImportingImages = MutableStateFlow(false)
   private var sendJob: Job? = null
   private var modelsJob: Job? = null
+  private val messageTreeMutex = Mutex()
 
   private val conversations =
     repository
@@ -81,6 +87,12 @@ class ChatViewModel(
         )
       }
       .combine(config) { state, currentConfig -> state.copy(config = currentConfig) }
+      .combine(generationStarting) { state, isStarting ->
+        state.copy(isPreparingGeneration = isStarting)
+      }
+      .combine(isChangingBranch) { state, changingBranch ->
+        state.copy(isChangingBranch = changingBranch)
+      }
       .combine(modelCatalog) { state, catalog ->
         state.copy(
           availableModels = catalog.models,
@@ -116,6 +128,7 @@ class ChatViewModel(
   }
 
   fun deleteConversation(id: Long) {
+    if (generationStarting.value || isChangingBranch.value) return
     viewModelScope.launch {
       if (generation.value.conversationId == id) sendJob?.cancelAndJoin()
       repository.deleteConversation(id)
@@ -123,62 +136,133 @@ class ChatViewModel(
     }
   }
 
-  fun send(rawPrompt: String) {
+  fun send(rawPrompt: String): Boolean {
     val prompt = rawPrompt.trim()
     val attachedImages = pendingImages.value
-    if ((prompt.isEmpty() && attachedImages.isEmpty()) || sendJob?.isActive == true || isImportingImages.value) return
+    val selectedId = selectedConversationId.value
+    if (prompt.isEmpty() && attachedImages.isEmpty()) return false
+    return launchGeneration {
+      val activeConversationId =
+        if (selectedId == null) {
+          repository.createConversation(titleFor(prompt.ifBlank { "图片对话" })).also {
+            selectedConversationId.value = it
+          }
+        } else {
+          val currentMessages = repository.messages(selectedId)
+          if (currentMessages.isEmpty()) {
+            repository.renameConversation(selectedId, titleFor(prompt.ifBlank { "图片对话" }))
+          }
+          selectedId
+        }
+      val parentMessageId = repository.messages(activeConversationId).lastOrNull()?.id
+      val userMessageId =
+        repository.addMessage(
+          activeConversationId,
+          MessageRole.User,
+          prompt,
+          attachedImages,
+          parentMessageId,
+        )
+      pendingImages.value = emptyList()
+      GenerationTarget(activeConversationId, userMessageId, prompt)
+    }
+  }
+
+  fun editUserMessage(messageId: Long, rawContent: String) {
+    val content = rawContent.trim()
+    launchGeneration {
+      val message = repository.message(messageId) ?: throw LlmApiException("找不到要编辑的消息")
+      if (message.role != MessageRole.User) throw LlmApiException("只能编辑用户消息")
+      if (content.isEmpty() && message.images.isEmpty()) return@launchGeneration null
+      if (content == message.content) return@launchGeneration null
+      if (repository.messages(message.conversationId).none { it.id == message.id }) {
+        throw LlmApiException("这条消息已不在当前分支")
+      }
+      val editedMessageId =
+        repository.addMessage(
+          message.conversationId,
+          MessageRole.User,
+          content,
+          message.images,
+          message.parentId,
+        )
+      GenerationTarget(message.conversationId, editedMessageId, content)
+    }
+  }
+
+  fun retryMessage(messageId: Long) {
+    launchGeneration {
+      val message = repository.message(messageId) ?: throw LlmApiException("找不到要重试的消息")
+      val user =
+        if (message.role == MessageRole.User) {
+          message
+        } else {
+          message.parentId?.let { repository.message(it) }
+        }
+      if (user?.role != MessageRole.User) throw LlmApiException("找不到这条回复对应的用户消息")
+      GenerationTarget(user.conversationId, user.id, user.content)
+    }
+  }
+
+  fun selectMessageBranch(messageId: Long, offset: Int) {
+    if (isChangingBranch.value || generationStarting.value || generation.value.conversationId != null) return
+    isChangingBranch.value = true
+    viewModelScope.launch {
+      try {
+        messageTreeMutex.withLock {
+          if (generationStarting.value || generation.value.conversationId != null) return@withLock
+          repository.selectSibling(messageId, offset)
+          errorMessage.value = null
+        }
+      } finally {
+        isChangingBranch.value = false
+      }
+    }
+  }
+
+  private fun launchGeneration(prepare: suspend () -> GenerationTarget?): Boolean {
+    if (isChangingBranch.value || generationStarting.value || sendJob?.isActive == true || isImportingImages.value) {
+      return false
+    }
     val currentConfig = config.value
     if (!currentConfig.isReady) {
       errorMessage.value = "请先在设置中填写有效的 API 地址和模型名称"
-      return
+      return false
     }
 
     errorMessage.value = null
+    generationStarting.value = true
     sendJob =
       viewModelScope.launch {
-        var conversationId: Long? = null
+        var target: GenerationTarget? = null
         var generatedText = ""
         try {
-          val selectedId = selectedConversationId.value
-          val activeConversationId =
-            if (selectedId == null) {
-              repository.createConversation(titleFor(prompt.ifBlank { "图片对话" })).also {
-                selectedConversationId.value = it
-              }
-            } else {
-              if (repository.messages(selectedId).isEmpty()) {
-                repository.renameConversation(selectedId, titleFor(prompt.ifBlank { "图片对话" }))
-              }
-              selectedId
-            }
-          conversationId = activeConversationId
-
-          val userMessageId = repository.addMessage(
-            activeConversationId,
-            MessageRole.User,
-            prompt,
-            attachedImages,
-          )
-          pendingImages.value = emptyList()
+          val activeTarget = messageTreeMutex.withLock { prepare() } ?: return@launch
+          target = activeTarget
           generation.value =
             Generation(
-              conversationId = activeConversationId,
-              userMessageId = userMessageId,
+              conversationId = activeTarget.conversationId,
+              userMessageId = activeTarget.userMessageId,
             )
+          generationStarting.value = false
 
-          val explicitImagePrompt = explicitImagePrompt(prompt)
+          val activePath = repository.messages(activeTarget.conversationId)
+          val userMessageIndex = activePath.indexOfFirst { it.id == activeTarget.userMessageId }
+          if (userMessageIndex == -1) throw LlmApiException("找不到当前消息分支")
+          val history = activePath.take(userMessageIndex + 1)
+          val explicitImagePrompt = explicitImagePrompt(activeTarget.prompt)
           if (explicitImagePrompt != null) {
             generation.value = generation.value.copy(text = "正在生成图片…")
             val generated = apiClient.generateImage(currentConfig, explicitImagePrompt)
             val savedImages = generated.map { imageStore.saveGeneratedImage(it.source) }
             if (savedImages.isEmpty()) throw LlmApiException("图片模型没有返回图片")
             persistAssistantMessage(
-              activeConversationId,
+              activeTarget.conversationId,
+              activeTarget.userMessageId,
               "已生成图片",
               savedImages,
             )
           } else {
-            val history = repository.messages(activeConversationId)
             var toolName: String? = null
             val toolArguments = StringBuilder()
             val responseImages = mutableListOf<String>()
@@ -203,7 +287,8 @@ class ChatViewModel(
               val savedImages = generated.map { imageStore.saveGeneratedImage(it.source) }
               if (savedImages.isEmpty()) throw LlmApiException("图片模型没有返回图片")
               persistAssistantMessage(
-                activeConversationId,
+                activeTarget.conversationId,
+                activeTarget.userMessageId,
                 generatedText.ifBlank { "已生成图片" },
                 savedImages,
               )
@@ -213,39 +298,67 @@ class ChatViewModel(
                 throw LlmApiException("模型没有返回文本或图片内容")
               }
               persistAssistantMessage(
-                activeConversationId,
+                activeTarget.conversationId,
+                activeTarget.userMessageId,
                 generatedText,
                 savedImages,
               )
             }
           }
         } catch (cancelled: CancellationException) {
-          if (generatedText.isNotBlank() && conversationId != null) {
-            persistAssistantMessage(conversationId, generatedText)
+          if (generatedText.isNotBlank()) {
+            target?.let {
+              persistAssistantMessage(it.conversationId, it.userMessageId, generatedText)
+            }
           }
           throw cancelled
         } catch (error: Exception) {
-          if (generatedText.isNotBlank() && conversationId != null) {
-            persistAssistantMessage(conversationId, generatedText)
+          if (generatedText.isNotBlank()) {
+            target?.let {
+              persistAssistantMessage(it.conversationId, it.userMessageId, generatedText)
+            }
           }
           errorMessage.value = "生成失败：${error.message ?: "未知错误"}"
         } finally {
-          if (generation.value.conversationId == conversationId) generation.value = Generation()
+          if (generation.value.conversationId == target?.conversationId) generation.value = Generation()
+          generationStarting.value = false
         }
       }
+    return true
   }
 
   private suspend fun persistAssistantMessage(
     conversationId: Long,
+    userMessageId: Long,
     content: String,
     images: List<MessageImage> = emptyList(),
-  ) = withContext(NonCancellable) {
-    val messageId = repository.addMessage(conversationId, MessageRole.Assistant, content, images)
-    if (generation.value.conversationId != conversationId) return@withContext
-    combine(messages, selectedConversationId) { messageList, selectedId ->
-        selectedId != conversationId || messageList.any { it.id == messageId }
+  ) {
+    withContext(NonCancellable) {
+      val messageId =
+        repository.addMessage(
+          conversationId,
+          MessageRole.Assistant,
+          content,
+          images,
+          userMessageId,
+        )
+      val scopeJob = viewModelScope.coroutineContext[Job]
+      if (scopeJob?.isActive != true || generation.value.conversationId != conversationId) {
+        return@withContext
       }
-      .first { it }
+      val messageVisible =
+        viewModelScope.async {
+          combine(messages, selectedConversationId) { messageList, selectedId ->
+              selectedId != conversationId || messageList.any { it.id == messageId }
+            }
+            .first { it }
+        }
+      try {
+        messageVisible.await()
+      } catch (_: CancellationException) {
+        // ViewModel teardown cancels this sibling observer while the message remains persisted.
+      }
+    }
   }
 
   fun stopGeneration() {
@@ -271,6 +384,7 @@ class ChatViewModel(
   }
 
   fun removePendingImage(image: MessageImage) {
+    if (generationStarting.value || sendJob?.isActive == true) return
     pendingImages.value = pendingImages.value - image
     viewModelScope.launch { imageStore.delete(image) }
   }
@@ -328,6 +442,8 @@ data class ChatUiState(
   val selectedConversationId: Long? = null,
   val messages: List<ChatMessage> = emptyList(),
   val generatingConversationId: Long? = null,
+  val isPreparingGeneration: Boolean = false,
+  val isChangingBranch: Boolean = false,
   val streamingUserMessageId: Long? = null,
   val streamingText: String = "",
   val errorMessage: String? = null,
@@ -339,7 +455,7 @@ data class ChatUiState(
   val isImportingImages: Boolean = false,
 ) {
   val isGenerating: Boolean
-    get() = generatingConversationId != null
+    get() = isPreparingGeneration || generatingConversationId != null
 
   val isGeneratingCurrentConversation: Boolean
     get() = generatingConversationId != null && generatingConversationId == selectedConversationId
@@ -352,6 +468,12 @@ private data class Generation(
   val conversationId: Long? = null,
   val userMessageId: Long? = null,
   val text: String = "",
+)
+
+private data class GenerationTarget(
+  val conversationId: Long,
+  val userMessageId: Long,
+  val prompt: String,
 )
 
 private data class ModelCatalog(
