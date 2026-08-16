@@ -92,6 +92,7 @@ import com.example.llmchat.data.MessageImage
 import com.mikepenz.markdown.coil3.Coil3ImageTransformerImpl
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownTypography
+import com.mikepenz.markdown.model.rememberMarkdownState
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -340,7 +341,7 @@ private fun MessageList(
   var followsLatest by remember(conversationId) { mutableStateOf(true) }
   var automaticScrollInProgress by remember(conversationId) { mutableStateOf(false) }
   var canResumeFromCurrentScroll by remember(conversationId) { mutableStateOf(false) }
-  val itemCount = messages.size + if (isGenerating) 1 else 0
+  val bottomAnchorIndex = messages.size + if (isGenerating) 1 else 0
   // The first drag pauses following; only a later drag can resume it at the bottom.
   LaunchedEffect(listState, conversationId) {
     listState.interactionSource.interactions.collect { interaction ->
@@ -370,38 +371,22 @@ private fun MessageList(
         }
       }
   }
-  // Track the last item's height so a growing streaming message stays aligned to its tail.
   LaunchedEffect(
+    listState,
     conversationId,
-    messages.lastOrNull()?.id,
-    isGenerating,
-    followsLatest,
+    bottomAnchorIndex,
   ) {
-    if (followsLatest && itemCount > 0) {
-      val targetIndex = itemCount - 1
-      automaticScrollInProgress = true
-      try {
-        if (listState.layoutInfo.visibleItemsInfo.none { it.index == targetIndex }) {
-          listState.scrollToItem(targetIndex)
-        }
-      } finally {
-        automaticScrollInProgress = false
-      }
-      snapshotFlow {
-          val layoutInfo = listState.layoutInfo
-          val itemSize = layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }?.size
-          itemSize?.let { it to layoutInfo.viewportSize.height }
-        }
-        .collect { metrics ->
-          val (itemSize, viewportHeight) = metrics ?: return@collect
+    snapshotFlow { listState.canScrollForward }
+      .collect { canScrollForward ->
+        if (followsLatest && canScrollForward) {
           automaticScrollInProgress = true
           try {
-            listState.scrollToItem(targetIndex, (itemSize - viewportHeight).coerceAtLeast(0))
+            listState.scrollToItem(bottomAnchorIndex)
           } finally {
             automaticScrollInProgress = false
           }
         }
-    }
+      }
   }
   LazyColumn(
     state = listState,
@@ -422,6 +407,7 @@ private fun MessageList(
         )
       }
     }
+    item(key = "bottom-anchor") { Spacer(Modifier.height(1.dp)) }
   }
 }
 
@@ -521,8 +507,9 @@ private fun MessageBubble(
             val markdown =
               if (content.isEmpty() && showCursor) "正在思考…"
               else content + if (showCursor) " ▍" else ""
+            val markdownState = rememberMarkdownState(markdown, retainState = true)
             Markdown(
-              content = markdown,
+              markdownState = markdownState,
               modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
               imageTransformer = Coil3ImageTransformerImpl,
               typography =
