@@ -5,10 +5,10 @@ plugins {
 }
 
 android {
-    namespace = "com.example.llmchat"
+    namespace = "cc.ykai.tinychat"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.example.llmchat"
+        applicationId = "cc.ykai.tinychat"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
