@@ -19,11 +19,13 @@ import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.layout.LazyLayoutCacheWindow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.text.KeyboardActions
@@ -316,6 +318,7 @@ private fun ConversationDrawer(
   }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageList(
   conversationId: Long?,
@@ -330,7 +333,10 @@ private fun MessageList(
     return
   }
 
-  val listState = rememberLazyListState()
+  val listState =
+    rememberLazyListState(
+      cacheWindow = LazyLayoutCacheWindow(aheadFraction = 2f, behindFraction = 2f),
+    )
   var followsLatest by remember(conversationId) { mutableStateOf(true) }
   var automaticScrollInProgress by remember(conversationId) { mutableStateOf(false) }
   var canResumeFromCurrentScroll by remember(conversationId) { mutableStateOf(false) }
@@ -403,9 +409,11 @@ private fun MessageList(
     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 18.dp),
     verticalArrangement = Arrangement.spacedBy(16.dp),
   ) {
-    items(messages, key = { it.id }) { MessageBubble(it.role, it.content, it.images) }
+    items(messages, key = { it.id }, contentType = { it.role }) {
+      MessageBubble(it.role, it.content, it.images)
+    }
     if (isGenerating) {
-      item(key = "streaming") {
+      item(key = "streaming", contentType = MessageRole.Assistant) {
         MessageBubble(
           role = MessageRole.Assistant,
           content = streamingText,
