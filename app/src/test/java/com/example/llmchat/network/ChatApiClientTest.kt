@@ -1,9 +1,79 @@
 package com.example.llmchat.network
 
+import com.example.llmchat.data.ApiConfig
+import com.example.llmchat.data.ChatMessage
+import com.example.llmchat.data.MessageRole
 import junit.framework.TestCase.assertEquals
+import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.junit.Test
 
 class ChatApiClientTest {
+  @Test
+  fun streamReply_requestsAndEmitsStreamingChunks() = runBlocking {
+    val server = MockWebServer()
+    server.dispatcher =
+      object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+          val requestBody = Json.parseToJsonElement(request.body.readUtf8()).jsonObject
+          return if (requestBody["stream"]?.jsonPrimitive?.booleanOrNull == true) {
+            MockResponse()
+              .setHeader("Content-Type", "text/event-stream")
+              .setBody(
+                """
+                data: {"choices":[{"delta":{"content":"first "}}]}
+
+                data: {"choices":[{"delta":{"content":"second"}}]}
+
+                data: [DONE]
+
+                """.trimIndent()
+              )
+          } else {
+            MockResponse()
+              .setHeader("Content-Type", "application/json")
+              .setBody("""{"choices":[{"message":{"content":"first second"}}]}""")
+          }
+        }
+      }
+    server.start()
+
+    try {
+      val events =
+        ChatApiClient()
+          .streamReply(
+            config = ApiConfig(baseUrl = server.url("/v1").toString(), model = "test-model"),
+            history =
+              listOf(
+                ChatMessage(
+                  id = 1,
+                  conversationId = 1,
+                  role = MessageRole.User,
+                  content = "test",
+                  createdAt = 0,
+                )
+              ),
+          )
+          .filterIsInstance<ChatStreamEvent.Text>()
+          .map { it.value }
+          .toList()
+
+      assertEquals(listOf("first ", "second"), events)
+    } finally {
+      server.shutdown()
+    }
+  }
+
   @Test
   fun endpoint_appendsChatCompletionsPath() {
     assertEquals(

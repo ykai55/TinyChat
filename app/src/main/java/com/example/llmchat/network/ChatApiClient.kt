@@ -58,6 +58,7 @@ class ChatApiClient(
             ChatRequest(
               model = config.model,
               messages = messages,
+              stream = true,
               tools = if (config.imageModel.isNotBlank()) imageGenerationTools else null,
               toolChoice = if (config.imageModel.isNotBlank()) "auto" else null,
             )
@@ -377,7 +378,7 @@ private val imageGenerationTools =
 private data class ChatRequest(
   val model: String,
   val messages: List<ApiMessage>,
-  val stream: Boolean = true,
+  val stream: Boolean,
   val tools: JsonElement? = null,
   @SerialName("tool_choice") val toolChoice: String? = null,
 )
